@@ -7,13 +7,9 @@ const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: process.env.CLIENT_ORIGIN || "*" },
   pingInterval: 10000,
-  pingTimeout: 20000
+  pingTimeout: 20000,
+  maxHttpBufferSize: 1e5
 });
-
-app.get("/", (_req, res) => {
-  res.type("text").send("Steel Tank Commander PvP server is running.");
-});
-app.get("/health", (_req, res) => res.json({ ok: true, waiting: queue.length, rooms: rooms.size }));
 
 const PORT = Number(process.env.PORT || 10000);
 const queue = [];
@@ -21,10 +17,20 @@ const rooms = new Map(); // roomId -> { players: [socketId, socketId], createdAt
 const socketRoom = new Map();
 const lastStateAt = new Map();
 const lastShotAt = new Map();
+const lastHitAt = new Map();
+
+app.get("/", (_req, res) => {
+  res.type("text").send("Steel Tank Commander PvP server is running.");
+});
+app.get("/health", (_req, res) => res.json({ ok: true, waiting: queue.length, rooms: rooms.size, protocol: 2 }));
 
 function removeFromQueue(id) {
   const i = queue.indexOf(id);
   if (i !== -1) queue.splice(i, 1);
+}
+function num(value, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : 0;
 }
 function safeTankIndex(value) {
   const n = Number(value);
@@ -37,8 +43,8 @@ function makeRoom(a, b) {
   socketRoom.set(a, roomId);
   socketRoom.set(b, roomId);
   const spawn = [
-    { x: -12, z: 0, yaw: Math.PI / 2 },
-    { x: 12, z: 0, yaw: -Math.PI / 2 }
+    { x: -12, y: 0, z: 0, yaw: Math.PI / 2 },
+    { x: 12, y: 0, z: 0, yaw: -Math.PI / 2 }
   ];
   for (let i = 0; i < 2; i++) {
     const id = room.players[i];
@@ -49,8 +55,8 @@ function makeRoom(a, b) {
       opponentId: room.players[1 - i],
       spawn: spawn[i],
       opponentSpawn: spawn[1 - i],
-      tankIndex: Number(io.sockets.sockets.get(id)?.data?.tankIndex ?? 0),
-      opponentTankIndex: Number(io.sockets.sockets.get(room.players[1 - i])?.data?.tankIndex ?? 0),
+      tankIndex: safeTankIndex(io.sockets.sockets.get(id)?.data?.tankIndex ?? 0),
+      opponentTankIndex: safeTankIndex(io.sockets.sockets.get(room.players[1 - i])?.data?.tankIndex ?? 0),
       map: "default"
     });
   }
@@ -75,7 +81,7 @@ function leaveRoom(socket, reason = "opponent-left") {
 }
 
 io.on("connection", socket => {
-  socket.emit("server:ready", { version: 1 });
+  socket.emit("server:ready", { version: 2 });
 
   socket.on("queue:join", payload => {
     if (socketRoom.has(socket.id)) {
@@ -83,7 +89,6 @@ io.on("connection", socket => {
       return;
     }
     removeFromQueue(socket.id);
-    // The server accepts only a small public model index, never client stats.
     socket.data.tankIndex = safeTankIndex(payload?.tankIndex);
     const opponentIndex = queue.findIndex(id => id !== socket.id && io.sockets.sockets.has(id));
     if (opponentIndex >= 0) {
@@ -100,22 +105,17 @@ io.on("connection", socket => {
     socket.emit("queue:cancelled");
   });
 
-  // State relay starter: server clamps values and rate-limits packets.
-  // For a competitive release, replace this relay with authoritative simulation.
+  // Clients send poses only while joined to a private 1v1 room.
   socket.on("player:state", state => {
     const roomId = socketRoom.get(socket.id);
     if (!roomId || !state || typeof state !== "object") return;
     const now = Date.now();
     if (now - (lastStateAt.get(socket.id) || 0) < 40) return; // max 25 updates/sec
     lastStateAt.set(socket.id, now);
-    const num = (v, min, max) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : 0;
-    };
     const clean = {
-      x: num(state.x, -48, 48),
+      x: num(state.x, -72, 72),
       y: num(state.y, 0, 8),
-      z: num(state.z, -48, 48),
+      z: num(state.z, -42, 42),
       yaw: num(state.yaw, -Math.PI * 8, Math.PI * 8),
       turretYaw: num(state.turretYaw, -Math.PI * 8, Math.PI * 8),
       tankIndex: safeTankIndex(state.tankIndex),
@@ -125,24 +125,38 @@ io.on("connection", socket => {
     socket.to(roomId).volatile.emit("opponent:state", clean);
   });
 
-  // Visual event relay only. Damage/hit confirmation must be decided by server
-  // before this can be used in a competitive build.
+  // Shot events are visuals only. Actual HP change is relayed separately after
+  // the attacker's local collision test. This remains prototype-grade netcode,
+  // not server-authoritative combat or anti-cheat.
   socket.on("player:fire-visual", shot => {
     const roomId = socketRoom.get(socket.id);
     if (!roomId || !shot || typeof shot !== "object") return;
     const now = Date.now();
-    if (now - (lastShotAt.get(socket.id) || 0) < 250) return;
+    if (now - (lastShotAt.get(socket.id) || 0) < 100) return;
     lastShotAt.set(socket.id, now);
-    const num = (v, min, max) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : 0;
-    };
     socket.to(roomId).emit("opponent:fire-visual", {
-      x: num(shot.x, -48, 48), y: num(shot.y, 0, 8), z: num(shot.z, -48, 48),
+      x: num(shot.x, -72, 72), y: num(shot.y, 0, 8), z: num(shot.z, -42, 42),
       yaw: num(shot.yaw, -Math.PI * 8, Math.PI * 8),
-      turretYaw: num(shot.turretYaw, -Math.PI * 8, Math.PI * 8),
-      seq: Math.floor(num(shot.seq, 0, 1e9))
+      turretYaw: num(shot.turretYaw ?? shot.yaw, -Math.PI * 8, Math.PI * 8)
     });
+  });
+
+  // Prototype hit relay. The receiver applies the bounded HP loss to its local
+  // tank. Because collision is still tested in the sender's browser, this is not
+  // cheat-resistant. Never treat the current prototype as competitive/secure.
+  socket.on("player:hit", payload => {
+    const roomId = socketRoom.get(socket.id);
+    const room = rooms.get(roomId);
+    if (!roomId || !room || !payload || typeof payload !== "object") return;
+    const now = Date.now();
+    if (now - (lastHitAt.get(socket.id) || 0) < 100) return;
+    lastHitAt.set(socket.id, now);
+    const damage = num(payload.damage, 0, 120);
+    if (damage <= 0) return;
+    const targetId = room.players.find(id => id !== socket.id);
+    if (targetId && io.sockets.sockets.has(targetId)) {
+      io.to(targetId).emit("player:damage", { damage, hitId: `${socket.id}:${now}` });
+    }
   });
 
   socket.on("match:leave", () => leaveRoom(socket, "opponent-left"));
@@ -152,6 +166,7 @@ io.on("connection", socket => {
     leaveRoom(socket, "connection-lost");
     lastStateAt.delete(socket.id);
     lastShotAt.delete(socket.id);
+    lastHitAt.delete(socket.id);
   });
 });
 
